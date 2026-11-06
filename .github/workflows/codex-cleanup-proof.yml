@@ -56,8 +56,8 @@ jobs:
           assert memory_kib >= 14 * 1024 * 1024, f'Runner lacks the expected 16 GB class memory: {memory_kib} KiB'
           expected = {
               'extensions/codex/src/app-server/run-attempt-resources.ts': '5a4a940eaed1da2ad320c506e0b94854b2d91006cedf483b500458558d3568fe',
-              'extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts': '371e42541f92c4c80737a6296dbb61d385d605beda9942108cd2b86863dc1928',
-              'config/test-lines-allocations/codex-isolated-client-close-order.txt': 'e5b5a7c03bdd1e140972b28989272deaaff61e69d1f44f8ac3a987b5fe1cbf3a',
+              'extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts': '3f075fbe5f59e3269166699dc15c9215a0d8dfd5d158e80653e490234048ad5e',
+              'config/test-lines-allocations/codex-isolated-client-close-order.txt': '7248b355d417b2f5b09409071b7d60ce60b74a99522249b2da75ad4ca1156d2b',
           }
           changed = subprocess.check_output(['git', 'diff', '--name-only', 'HEAD^', 'HEAD'], text=True).splitlines()
           assert set(changed) == set(expected), changed
