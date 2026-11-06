@@ -142,20 +142,21 @@ jobs:
           }
           pathlib.Path('proof/tsconfig.test.json').write_text(json.dumps(projection, indent=2) + '\n')
           PY
-          node scripts/run-tsgo.mjs -p extensions/codex/tsconfig.json --noEmit > proof/types-production.log 2>&1
-          node scripts/run-tsgo.mjs -p proof/tsconfig.test.json --noEmit > proof/types-test-projection.log 2>&1
+          test -f .artifacts/extension-package-boundary/compile/codex.tsconfig.json
+          node scripts/run-tsgo.mjs -p .artifacts/extension-package-boundary/compile/codex.tsconfig.json --noEmit --listFiles > proof/types-production.log 2>&1
+          node scripts/run-tsgo.mjs -p proof/tsconfig.test.json --noEmit --listFiles > proof/types-test-projection.log 2>&1
+          python3 - <<'PYFILES'
+          import pathlib
+          for log, source in [('proof/types-production.log', 'extensions/codex/src/app-server/run-attempt-resources.ts'), ('proof/types-test-projection.log', 'extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts')]:
+              assert str(pathlib.Path(source).resolve()) in pathlib.Path(log).read_text().splitlines(), (log, source)
+          PYFILES
 
       - name: Type-aware lint, formatting, and diff checks
         timeout-minutes: 10
-        env:
-          # The prior selected preparation generated required SDK/Kysely artifacts.
-          # This skips only duplicate preparation; type-aware lint stays enabled.
-          OPENCLAW_OXLINT_SKIP_PREPARE: "1"
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/run-oxlint.mjs --tsconfig extensions/codex/tsconfig.json extensions/codex/src/app-server/run-attempt-resources.ts > proof/lint-production.log 2>&1
-          node scripts/run-oxlint.mjs --tsconfig proof/tsconfig.test.json extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts > proof/lint-test.log 2>&1
+          node scripts/run-oxlint.mjs --tsconfig extensions/tsconfig.json extensions/codex/src/app-server/run-attempt-resources.ts extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts > proof/lint.log 2>&1
           node scripts/run-format.mts --check extensions/codex/src/app-server/run-attempt-resources.ts extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts > proof/format.log 2>&1
           git diff --check
 
