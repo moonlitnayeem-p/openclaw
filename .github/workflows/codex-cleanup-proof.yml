@@ -1,0 +1,177 @@
+name: Codex isolated-client cleanup proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact reviewed source commit (40 hex characters)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-isolated-client-proof-${{ inputs.target_sha }}
+  cancel-in-progress: false
+
+jobs:
+  focused-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      TARGET_SHA: ${{ inputs.target_sha }}
+      BASE_SHA: 36a1c58e91dd9ae991edd76f9ccbfdcd056c5fa0
+      OPENCLAW_VITEST_RUNTIME: node
+      OPENCLAW_TYPECHECKER: tsgo
+      OPENCLAW_FORMAT_TOOL: oxfmt
+      OPENCLAW_LINT_TOOL: oxlint
+      NODE_OPTIONS: --max-old-space-size=8192
+    steps:
+      - name: Validate immutable target
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.target_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify reviewed source and record runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git rev-parse HEAD^)" = "$BASE_SHA"
+          mkdir -p proof
+          python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess
+          memory_kib = int(next(line.split()[1] for line in pathlib.Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemTotal:')))
+          assert memory_kib >= 14 * 1024 * 1024, f'Runner lacks the expected 16 GB class memory: {memory_kib} KiB'
+          expected = {
+              'extensions/codex/src/app-server/run-attempt-resources.ts': '5a4a940eaed1da2ad320c506e0b94854b2d91006cedf483b500458558d3568fe',
+              'extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts': '371e42541f92c4c80737a6296dbb61d385d605beda9942108cd2b86863dc1928',
+              'config/test-lines-allocations/codex-isolated-client-close-order.txt': 'e5b5a7c03bdd1e140972b28989272deaaff61e69d1f44f8ac3a987b5fe1cbf3a',
+          }
+          changed = subprocess.check_output(['git', 'diff', '--name-only', 'HEAD^', 'HEAD'], text=True).splitlines()
+          assert set(changed) == set(expected), changed
+          actual = {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in expected}
+          assert actual == expected, actual
+          pathlib.Path('proof/source.json').write_text(json.dumps({'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': actual}, indent=2) + '\n')
+          PY
+          { node --version; uname -a; nproc; free -m; } > proof/runner.txt
+
+      - name: Prepare official Node and dependency environment
+        timeout-minutes: 10
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.22.2"
+          semantic-checks: "true"
+          install-bun: "true"
+          cache-mode: "off"
+
+      - name: Reproduce delayed-exit regression on original production source
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          { node --version; pnpm --version; } > proof/toolchain.txt
+          resource=extensions/codex/src/app-server/run-attempt-resources.ts
+          trap 'git restore --source="$TARGET_SHA" -- "$resource"' EXIT
+          git show "$BASE_SHA:$resource" > "$resource"
+          set +e
+          /usr/bin/time -v -o proof/baseline-time.txt pnpm test extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts --maxWorkers=1 -t 'preserves the one-shot grace before releasing its isolated client lease' --reporter=json --outputFile=proof/baseline.json > proof/baseline.log 2>&1
+          status=$?
+          set -e
+          test "$status" -eq 1
+          python3 - <<'PY'
+          import json, pathlib
+          report = json.loads(pathlib.Path('proof/baseline.json').read_text())
+          failures = [a for t in report['testResults'] for a in t['assertionResults'] if a['status'] == 'failed']
+          assert report['numFailedTests'] == 1 and len(failures) == 1, report
+          failed = failures[0]
+          assert failed['title'] == 'preserves the one-shot grace before releasing its isolated client lease', failed
+          messages = '\n'.join(failed['failureMessages'])
+          assert 'readCodexAppServerProcessSnapshot' in messages and ('not be called' in messages or 'not to be called' in messages), messages
+          print('Expected original shutdown-grace regression reproduced.')
+          PY
+
+      - name: Run patched owning cleanup suite
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          /usr/bin/time -v -o proof/patched-time.txt pnpm test extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts --maxWorkers=1 --reporter=json --outputFile=proof/patched.json > proof/patched.log 2>&1
+          python3 - <<'PY'
+          import json, pathlib
+          report = json.loads(pathlib.Path('proof/patched.json').read_text())
+          assert report['numFailedTests'] == 0 and report['success'] is True, report
+          assertions = [a for t in report['testResults'] for a in t['assertionResults']]
+          assert len(assertions) == 14 and all(a['status'] == 'passed' for a in assertions), assertions
+          statuses = {a['title']: a['status'] for a in assertions}
+          for title in ['preserves the one-shot grace before releasing its isolated client lease', 'releases its isolated client lease once when shutdown is rejected', 'releases its isolated client lease once when shutdown is uncertain']:
+              assert statuses.get(title) == 'passed', (title, statuses)
+          print('All owning cleanup cases and all three added regressions passed.')
+          PY
+
+      - name: Prepare selected Codex declaration boundary
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o proof/declarations-time.txt node --import ./scripts/tsx.mjs scripts/prepare-extension-package-boundary-artifacts.mts --mode=all '--extensions=["codex"]' > proof/declarations.log 2>&1
+
+      - name: Typecheck Codex production and focused test projection
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          projection = {
+              'extends': '../test/tsconfig/tsconfig.extensions.test.json',
+              'compilerOptions': {'incremental': True, 'tsBuildInfoFile': './test-types.tsbuildinfo'},
+              'include': ['../test/types/vitest-codex-attempt-runtime.d.ts', '../src/**/*.d.ts', '../ui/**/*.d.ts', '../extensions/**/*.d.ts', '../packages/**/*.d.ts', '../extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts'],
+          }
+          pathlib.Path('proof/tsconfig.test.json').write_text(json.dumps(projection, indent=2) + '\n')
+          PY
+          node scripts/run-tsgo.mjs -p extensions/codex/tsconfig.json --noEmit > proof/types-production.log 2>&1
+          node scripts/run-tsgo.mjs -p proof/tsconfig.test.json --noEmit > proof/types-test-projection.log 2>&1
+
+      - name: Type-aware lint, formatting, and diff checks
+        timeout-minutes: 10
+        env:
+          # The prior selected preparation generated required SDK/Kysely artifacts.
+          # This skips only duplicate preparation; type-aware lint stays enabled.
+          OPENCLAW_OXLINT_SKIP_PREPARE: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/run-oxlint.mjs --tsconfig extensions/codex/tsconfig.json extensions/codex/src/app-server/run-attempt-resources.ts > proof/lint-production.log 2>&1
+          node scripts/run-oxlint.mjs --tsconfig proof/tsconfig.test.json extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts > proof/lint-test.log 2>&1
+          node scripts/run-format.mts --check extensions/codex/src/app-server/run-attempt-resources.ts extensions/codex/src/app-server/run-attempt-one-shot-cleanup.test.ts > proof/format.log 2>&1
+          git diff --check
+
+      - name: Build and validate only the Codex npm runtime
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/time -v -o proof/build-time.txt node --import ./scripts/tsx.mjs scripts/check-plugin-npm-runtime-builds.mts --package extensions/codex > proof/build.log 2>&1
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git diff --exit-code
+
+      - name: Upload synthetic proof and resource timings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: codex-cleanup-proof-${{ inputs.target_sha }}
+          path: proof/
+          retention-days: 14
+          if-no-files-found: warn
